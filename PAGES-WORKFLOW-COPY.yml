@@ -1,0 +1,77 @@
+name: Deploy FILE CONVERTER to GitHub Pages
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - "**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout FILE CONVERTER
+        uses: actions/checkout@v4
+        with:
+          path: app
+          persist-credentials: false
+
+      - name: Checkout upstream LibreOffice WebAssembly runtime
+        uses: actions/checkout@v4
+        with:
+          repository: Skitionek/serverless-office-converter
+          ref: main
+          path: upstream
+          persist-credentials: false
+
+      - name: Assemble and verify complete static site
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f app/index.html
+          test -f upstream/web/office-converter/index.js
+          test -f upstream/web/office-converter/office-engine.js
+          test -f upstream/web/office-converter/isolation.js
+          test -f upstream/web/office-converter/service-worker.js
+          test -f upstream/web/office-converter/lo/manifest.json
+          test -f upstream/web/sw.js
+          mkdir -p _site
+          cp -a upstream/web/. _site/
+          cp app/index.html _site/index.html
+          cp app/THIRD-PARTY-NOTICES.md _site/THIRD-PARTY-NOTICES.md
+          touch _site/.nojekyll
+          test -f _site/index.html
+          test -f _site/sw.js
+          test -f _site/office-converter/index.js
+          test -f _site/office-converter/office-engine.js
+          test -f _site/office-converter/isolation.js
+          test -f _site/office-converter/service-worker.js
+          test -f _site/office-converter/lo/manifest.json
+          echo "Verified all engine files. Site root:"
+          find _site/office-converter -maxdepth 2 -type f | head -50
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
