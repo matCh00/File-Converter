@@ -1,2 +1,0 @@
-FILE CONVERTER release: 2026-10-28-engine-fix-v2
-Build fingerprint: meta[name="file-converter-build"] in index.html

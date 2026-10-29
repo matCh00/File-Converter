@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="pl">
 <head>
-  <meta name="file-converter-build" content="2026-10-28-engine-fix-v2">
+  <meta name="file-converter-build" content="2026-10-29-mobile-memory-guard-v1">
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#090b12">
@@ -213,7 +213,7 @@
       #ambient { opacity: .22; }
     }
   </style>
-  <!-- FILE CONVERTER build: 2026-10-28-engine-fix-v2; deploy workflow must publish upstream/web/office-converter/. -->
+  <!-- FILE CONVERTER build: 2026-10-29-mobile-memory-guard-v1; mobile worker cleanup and reduced background rendering. -->
 </head>
 <body>
   <canvas id="ambient" aria-hidden="true"></canvas>
@@ -321,6 +321,13 @@
   </div>
 
   <script type="module">
+    // Mobile safeguards: WebAssembly may reserve a large virtual memory region.
+    // Detect phones/tablets conservatively; this affects cleanup and warnings only.
+    const isMobileDevice = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent) ||
+      (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    const reportedDeviceMemoryGB = Number(navigator.deviceMemory) || 0;
+    const mobileLargeFileWarningBytes = (reportedDeviceMemoryGB > 0 && reportedDeviceMemoryGB <= 4 ? 10 : 15) * 1024 * 1024;
+
     // Uruchamiaj inicjalizację silnika w try/catch. Brak pliku z silnikiem nie może
     // zatrzymać obsługi uploadu ani animowanego tła — to był główny skutek błędu 404.
     let officeEngine = null;
@@ -404,6 +411,9 @@
         $('actions').style.display = '';
         processState.classList.remove('visible');
         setError('');
+        errorMessage.style.borderColor = '';
+        errorMessage.style.background = '';
+        errorMessage.style.color = '';
         clearOutput();
         stepLabel.textContent = '01 — DODAJ PLIK';
       };
@@ -427,8 +437,11 @@
         setError('');
         stepLabel.textContent = '02 — GOTOWY DO KONWERSJI';
         clearOutput();
-        if (file.size > 30 * 1024 * 1024) {
-          setError('To duży plik. Na telefonie konwersja może wymagać sporo pamięci i potrwać dłużej. Nie zamykaj karty do zakończenia procesu.');
+        const largeFileThreshold = isMobileDevice ? mobileLargeFileWarningBytes : 30 * 1024 * 1024;
+        if (file.size > largeFileThreshold) {
+          setError(isMobileDevice
+            ? 'To dość duży plik dla części telefonów. Konwersja może wymagać dużo pamięci. Po zadaniu silnik zostanie zamknięty, aby ograniczyć obciążenie; jeśli zabraknie pamięci, spróbuj mniejszego pliku lub komputera.'
+            : 'To duży plik. Konwersja może wymagać sporo pamięci i potrwać dłużej. Nie zamykaj karty do zakończenia procesu.');
           errorMessage.style.borderColor = 'rgba(255,210,140,.24)';
           errorMessage.style.background = 'rgba(255,210,140,.045)';
           errorMessage.style.color = '#f4d9ab';
@@ -542,15 +555,38 @@
         } catch (error) {
           console.error('FILE CONVERTER LibreOffice conversion error:', error);
           const details = error && error.message ? error.message : 'Nieznany błąd silnika.';
-          setError(`Konwersja LibreOffice nie powiodła się. Oryginalny plik nie został zmieniony. Szczegóły: ${details}`);
+          const looksLikeMemoryFailure = /out of memory|allocation failed|failed to allocate|could not allocate|cannot enlarge memory|memory access out of bounds|arraybuffer allocation|webassembly\.memory|oom/i.test(String(details));
+          if (looksLikeMemoryFailure) {
+            setError(`${isMobileDevice ? 'Telefon lub przeglądarka nie udostępniły wystarczającej pamięci' : 'Przeglądarka nie udostępniła wystarczającej pamięci'} do tej konwersji. Oryginalny plik nie został zmieniony. Zamknij zbędne karty, spróbuj mniejszego pliku albo użyj komputera.`);
+          } else {
+            setError(`Konwersja LibreOffice nie powiodła się. Oryginalny plik nie został zmieniony. Szczegóły: ${details}`);
+          }
           stepLabel.textContent = 'BŁĄD — SPRÓBUJ PONOWNIE';
         } finally {
+          // Mobile browsers may retain the WebAssembly heap while a Worker is alive.
+          // Keep the generated Blob for download, but stop the engine worker after every
+          // mobile attempt. OfficeEngine can start a fresh worker on the next conversion.
+          if (isMobileDevice && officeEngine && typeof officeEngine.stop === 'function') {
+            try {
+              officeEngine.stop('Mobile cleanup after conversion attempt.');
+            } catch (cleanupError) {
+              console.warn('FILE CONVERTER: nie udało się zakończyć silnika po konwersji.', cleanupError);
+            }
+          }
           isConverting = false;
           processState.classList.remove('visible');
           convertBtn.style.display = '';
           $('actions').style.display = '';
           convertBtn.querySelector('span').textContent = 'Konwertuj ponownie';
           convertBtn.disabled = !selectedFile;
+          // Restart the decorative animation only after the compute-heavy task finished.
+          // Cancel any frame that was already queued to avoid accidentally creating two loops
+          // if a small workbook finishes before the next animation frame fires.
+          if (!reducedMotion && !document.hidden) {
+            if (rafId) cancelAnimationFrame(rafId);
+            rafId = 0;
+            draw();
+          }
         }
       });
 
@@ -602,12 +638,15 @@
       let width = 0, height = 0, dpr = 1, particles = [], ripples = [], pointer = { x: -1000, y: -1000, active: false }, rafId = 0;
       const random = (min, max) => Math.random() * (max - min) + min;
       const resizeCanvas = () => {
-        dpr = Math.min(window.devicePixelRatio || 1, 1.7);
+        // Lower canvas backing resolution and particle count on phones to reduce GPU/CPU work.
+        dpr = Math.min(window.devicePixelRatio || 1, isMobileDevice ? 1.35 : 1.7);
         width = Math.max(1, window.innerWidth); height = Math.max(1, window.innerHeight);
         canvas.width = Math.floor(width * dpr); canvas.height = Math.floor(height * dpr);
         canvas.style.width = `${width}px`; canvas.style.height = `${height}px`;
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-        const count = Math.min(76, Math.max(24, Math.round(width * height / 18000)));
+        const count = isMobileDevice
+          ? Math.min(36, Math.max(16, Math.round(width * height / 26000)))
+          : Math.min(76, Math.max(24, Math.round(width * height / 18000)));
         particles = Array.from({ length: count }, () => ({ x: random(0,width), y: random(0,height), vx: random(-.13,.13), vy: random(-.12,.12), r: random(.6,1.7), phase: random(0,Math.PI*2) }));
       };
       const addRipple = (x,y) => { ripples.push({x,y,r:2,life:1}); if(ripples.length>8) ripples.shift(); };
@@ -616,7 +655,16 @@
       window.addEventListener('pointerleave', () => { pointer.active=false; }, {passive:true});
       window.addEventListener('resize', resizeCanvas, {passive:true});
       resizeCanvas();
-      const draw = () => {
+      let lastMobileFrame = -1000;
+      const draw = (timestamp = 0) => {
+        // Pause decorative work while hidden or while LibreOffice is converting.
+        if (document.hidden || isConverting) { rafId = 0; return; }
+        // Cap decorative rendering at ~30 fps on mobile without changing the visual layout.
+        if (isMobileDevice && !reducedMotion && timestamp - lastMobileFrame < 1000 / 30) {
+          rafId = requestAnimationFrame(draw);
+          return;
+        }
+        if (isMobileDevice) lastMobileFrame = timestamp;
         ctx.clearRect(0,0,width,height);
         const touchRadius = width < 700 ? 100 : 150;
         for(let i=0;i<particles.length;i++) {
@@ -633,12 +681,13 @@
           if(pointer.active) { const dx=p.x-pointer.x,dy=p.y-pointer.y,dist=Math.hypot(dx,dy); if(dist<touchRadius){ctx.beginPath();ctx.moveTo(p.x,p.y);ctx.lineTo(pointer.x,pointer.y);ctx.strokeStyle=`rgba(122,245,208,${(1-dist/touchRadius)*.18})`;ctx.lineWidth=.7;ctx.stroke();} }
         }
         for(let i=ripples.length-1;i>=0;i--){const r=ripples[i];ctx.beginPath();ctx.arc(r.x,r.y,r.r,0,Math.PI*2);ctx.strokeStyle=`rgba(122,245,208,${r.life*.36})`;ctx.lineWidth=1;ctx.stroke();if(!reducedMotion){r.r+=2.3;r.life-=.018;}if(r.life<=0)ripples.splice(i,1);}
-        if(!reducedMotion) rafId=requestAnimationFrame(draw);
+        if(!reducedMotion && !document.hidden && !isConverting) rafId=requestAnimationFrame(draw);
+        else rafId=0;
       };
       draw();
       document.addEventListener('visibilitychange', () => {
-        if (document.hidden && rafId) cancelAnimationFrame(rafId);
-        else if (!document.hidden && !reducedMotion) draw();
+        if (document.hidden && rafId) { cancelAnimationFrame(rafId); rafId = 0; }
+        else if (!document.hidden && !reducedMotion && !isConverting) draw();
       });
       if (reducedMotion) { /* Jedna statyczna klatka, zgodnie z preferencją użytkownika. */ }
     })();
